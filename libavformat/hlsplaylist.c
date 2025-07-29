@@ -79,7 +79,7 @@ void ff_hls_write_stream_info(AVStream *st, AVIOContext *out, int bandwidth,
                               int avg_bandwidth,
                               const char *filename, const char *agroup,
                               const char *codecs, const char *ccgroup,
-                              const char *sgroup)
+                              const char *sgroup, double frame_rate)
 {
     if (!out || !filename)
         return;
@@ -96,6 +96,8 @@ void ff_hls_write_stream_info(AVStream *st, AVIOContext *out, int bandwidth,
     if (st && st->codecpar->width > 0 && st->codecpar->height > 0)
         avio_printf(out, ",RESOLUTION=%dx%d", st->codecpar->width,
                 st->codecpar->height);
+    if (frame_rate > 0)
+        avio_printf(out, ",FRAME-RATE=%.3f", frame_rate);
     if (codecs && codecs[0])
         avio_printf(out, ",CODECS=\"%s\"", codecs);
     if (agroup && agroup[0])

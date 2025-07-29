@@ -1603,12 +1603,14 @@ static int create_master_playlist(AVFormatContext *s,
         }
 
         if (!hls->has_default_key || !hls->has_video_m3u8) {
+            double frame_rate = vid_st ? av_q2d(vid_st->r_frame_rate) : 0.0;
             ff_hls_write_stream_info(vid_st, hls->m3u8_out, bandwidth, avg_bandwidth, m3u8_rel_name,
-                    aud_st ? vs->agroup : NULL, vs->codec_attr, ccgroup, sgroup);
+                    aud_st ? vs->agroup : NULL, vs->codec_attr, ccgroup, sgroup, frame_rate);
         } else {
             if (vid_st) {
+                double frame_rate = av_q2d(vid_st->r_frame_rate);
                 ff_hls_write_stream_info(vid_st, hls->m3u8_out, bandwidth, avg_bandwidth, m3u8_rel_name,
-                                         aud_st ? vs->agroup : NULL, vs->codec_attr, ccgroup, sgroup);
+                                         aud_st ? vs->agroup : NULL, vs->codec_attr, ccgroup, sgroup, frame_rate);
             }
         }
     }

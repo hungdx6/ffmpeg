@@ -46,7 +46,7 @@ void ff_hls_write_stream_info(AVStream *st, AVIOContext *out, int bandwidth,
                               int avg_bandwidth,
                               const char *filename, const char *agroup,
                               const char *codecs, const char *ccgroup,
-                              const char *sgroup);
+                              const char *sgroup, double frame_rate);
 void ff_hls_write_playlist_header(AVIOContext *out, int version, int allowcache,
                                   int target_duration, int64_t sequence,
                                   uint32_t playlist_type, int iframe_mode);
