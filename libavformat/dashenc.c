@@ -1320,10 +1320,9 @@ static int write_manifest(AVFormatContext *s, int final)
                     av_strlcat(codec_str, audio_codec_str, sizeof(codec_str));
                 }
                 get_hls_playlist_name(playlist_file, sizeof(playlist_file), NULL, i);
-                double frame_rate = (st->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) ? av_q2d(st->r_frame_rate) : 0.0;
                 ff_hls_write_stream_info(st, c->m3u8_out, stream_bitrate, 0,
                                          playlist_file, agroup,
-                                         codec_str, NULL, NULL, frame_rate);
+                                         codec_str, NULL, NULL);
             }
 
         } else {
@@ -1347,10 +1346,9 @@ static int write_manifest(AVFormatContext *s, int final)
                     continue;
                 av_strlcpy(codec_str, os->codec_str, sizeof(codec_str));
                 get_hls_playlist_name(playlist_file, sizeof(playlist_file), NULL, i);
-                double frame_rate = (st->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) ? av_q2d(st->r_frame_rate) : 0.0;
                 ff_hls_write_stream_info(st, c->m3u8_out, stream_bitrate, 0,
                                          playlist_file, NULL,
-                                         codec_str, NULL, NULL, frame_rate);
+                                         codec_str, NULL, NULL);
             }
         }
 
