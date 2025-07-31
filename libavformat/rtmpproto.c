@@ -35,6 +35,7 @@
 #include "libavutil/mem.h"
 #include "libavutil/opt.h"
 #include "libavutil/random_seed.h"
+#include "libavutil/time.h"
 #include "avformat.h"
 #include "internal.h"
 
@@ -134,6 +135,13 @@ typedef struct RTMPContext {
     char          auth_params[500];
     int           do_reconnect;
     int           auth_tried;
+    int           reconnect_streamed;         ///< auto reconnect if connection is broken
+    int           reconnect_delay_max;        ///< max reconnect delay in ms
+    int           reconnect_delay;            ///< current reconnect delay in ms
+    int64_t       reconnect_at;               ///< timestamp when to reconnect
+    int           reconnect_count;            ///< number of reconnect attempts
+    int           reconnect_enabled;          ///< reconnect feature enabled
+    char          *original_uri;              ///< original URI for reconnect
 } RTMPContext;
 
 #define PLAYER_KEY_OPEN_PART_LEN 30   ///< length of partial key used for first client digest signing
@@ -162,6 +170,10 @@ static const uint8_t rtmp_server_key[] = {
 static int handle_chunk_size(URLContext *s, RTMPPacket *pkt);
 static int handle_window_ack_size(URLContext *s, RTMPPacket *pkt);
 static int handle_set_peer_bw(URLContext *s, RTMPPacket *pkt);
+static int rtmp_handshake(URLContext *s, RTMPContext *rt);
+static int gen_connect(URLContext *s, RTMPContext *rt);
+static void reset_connection_state(RTMPContext *rt);
+static int attempt_reconnect(URLContext *s);
 
 static int add_tracked_method(RTMPContext *rt, const char *name, int id)
 {
@@ -227,6 +239,139 @@ static void free_tracked_methods(RTMPContext *rt)
     av_freep(&rt->tracked_methods);
     rt->tracked_methods_size = 0;
     rt->nb_tracked_methods   = 0;
+}
+
+static void reset_connection_state(RTMPContext *rt)
+{
+    int i;
+    
+    // Reset packet history
+    rt->nb_invokes = 0;
+    for (i = 0; i < 2; i++)
+        memset(rt->prev_pkt[i], 0,
+               sizeof(**rt->prev_pkt) * rt->nb_prev_pkt[i]);
+    
+    // Free tracked methods
+    free_tracked_methods(rt);
+    
+    // Reset stream and protocol state
+    rt->state = STATE_START;
+    rt->stream_id = 0;
+    rt->bytes_read = 0;
+    rt->last_bytes_read = 0;
+    rt->last_timestamp = 0;
+    rt->has_audio = 0;
+    rt->has_video = 0;
+    rt->received_metadata = 0;
+    rt->flv_header_bytes = 0;
+    rt->do_reconnect = 0;
+    rt->auth_tried = 0;
+}
+
+static int attempt_reconnect(URLContext *s)
+{
+    RTMPContext *rt = s->priv_data;
+    char proto[8], hostname[256], path[1024], auth[100];
+    char buf[2048];
+    int port;
+    int ret;
+    int64_t now = av_gettime_relative() / 1000; // convert to milliseconds
+    
+    // Check if we should attempt reconnect
+    if (!rt->reconnect_enabled && !rt->reconnect_streamed)
+        return AVERROR(EIO);
+    
+    // Check reconnect timeout (60 seconds = 60000 ms)
+    if (rt->reconnect_count == 0) {
+        rt->reconnect_at = now;
+    } else if (now - rt->reconnect_at > rt->reconnect_delay_max) {
+        av_log(s, AV_LOG_ERROR, "Reconnect timeout exceeded (%d ms), giving up\n", 
+               rt->reconnect_delay_max);
+        return AVERROR(ETIMEDOUT);
+    }
+    
+    // Exponential backoff with jitter: start at 1s, max 10s
+    if (rt->reconnect_count > 0) {
+        rt->reconnect_delay = FFMIN(1000 * (1 << (rt->reconnect_count - 1)), 10000);
+        av_log(s, AV_LOG_INFO, "Reconnect attempt %d, waiting %d ms\n", 
+               rt->reconnect_count + 1, rt->reconnect_delay);
+        av_usleep(rt->reconnect_delay * 1000); // convert to microseconds
+    }
+    
+    rt->reconnect_count++;
+    
+    // Close existing connection
+    if (rt->stream) {
+        ffurl_closep(&rt->stream);
+    }
+    
+    // Reset connection state
+    reset_connection_state(rt);
+    
+    av_log(s, AV_LOG_INFO, "Attempting to reconnect to RTMP server (attempt %d)\n", 
+           rt->reconnect_count);
+    
+    // Parse URL again
+    av_url_split(proto, sizeof(proto), auth, sizeof(auth),
+                 hostname, sizeof(hostname), &port,
+                 path, sizeof(path), rt->original_uri);
+    
+    // Build connection URL
+    if (!strcmp(proto, "rtmpt") || !strcmp(proto, "rtmpts")) {
+        ff_url_join(buf, sizeof(buf), "ffrtmphttp", NULL, hostname, port, NULL);
+    } else if (!strcmp(proto, "rtmps")) {
+        if (port < 0)
+            port = RTMPS_DEFAULT_PORT;
+        ff_url_join(buf, sizeof(buf), "tls", NULL, hostname, port, NULL);
+    } else if (!strcmp(proto, "rtmpe") || (!strcmp(proto, "rtmpte"))) {
+        ff_url_join(buf, sizeof(buf), "ffrtmpcrypt", NULL, hostname, port, NULL);
+        rt->encrypted = 1;
+    } else {
+        if (port < 0)
+            port = RTMP_DEFAULT_PORT;
+        ff_url_join(buf, sizeof(buf), "tcp", NULL, hostname, port, "?tcp_nodelay=%d", rt->tcp_nodelay);
+    }
+    
+    // Attempt to reconnect
+    if ((ret = ffurl_open_whitelist(&rt->stream, buf, AVIO_FLAG_READ_WRITE,
+                                    &s->interrupt_callback, NULL,
+                                    s->protocol_whitelist, s->protocol_blacklist, s)) < 0) {
+        av_log(s, AV_LOG_WARNING, "Reconnect failed: Cannot open connection %s\n", buf);
+        return ret;
+    }
+    
+    // Perform handshake
+    rt->state = STATE_START;
+    if ((ret = rtmp_handshake(s, rt)) < 0) {
+        av_log(s, AV_LOG_WARNING, "Reconnect failed: Handshake failed\n");
+        ffurl_closep(&rt->stream);
+        return ret;
+    }
+    
+    rt->out_chunk_size = 128;
+    rt->in_chunk_size  = 128;
+    rt->state = STATE_HANDSHAKED;
+    
+    // Reconnect to app and stream
+    if ((ret = gen_connect(s, rt)) < 0) {
+        av_log(s, AV_LOG_WARNING, "Reconnect failed: Connect failed\n");
+        ffurl_closep(&rt->stream);
+        return ret;
+    }
+    
+    do {
+        ret = get_packet(s, 1);
+    } while (ret == AVERROR(EAGAIN));
+    
+    if (ret < 0) {
+        av_log(s, AV_LOG_WARNING, "Reconnect failed: Initial packet failed\n");
+        ffurl_closep(&rt->stream);
+        return ret;
+    }
+    
+    av_log(s, AV_LOG_INFO, "Successfully reconnected to RTMP server\n");
+    rt->reconnect_count = 0; // Reset counter on successful reconnect
+    return 0;
 }
 
 static int rtmp_send_packet(RTMPContext *rt, RTMPPacket *pkt, int track)
@@ -2483,6 +2628,13 @@ static int get_packet(URLContext *s, int for_header)
             if (ret == 0) {
                 return AVERROR(EAGAIN);
             } else {
+                // Connection error, try to reconnect if enabled
+                if ((rt->reconnect_enabled || rt->reconnect_streamed) && rt->is_input) {
+                    av_log(s, AV_LOG_WARNING, "Connection lost, attempting to reconnect\n");
+                    if (attempt_reconnect(s) >= 0) {
+                        continue; // Retry with new connection
+                    }
+                }
                 return AVERROR(EIO);
             }
         }
@@ -2574,6 +2726,7 @@ static int rtmp_close(URLContext *h)
 
     free_tracked_methods(rt);
     av_freep(&rt->flv_data);
+    av_freep(&rt->original_uri);
     ffurl_closep(&rt->stream);
     return ret;
 }
@@ -2664,6 +2817,19 @@ static int rtmp_open(URLContext *s, const char *uri, int flags, AVDictionary **o
         rt->listen = 1;
 
     rt->is_input = !(flags & AVIO_FLAG_WRITE);
+
+    // Save original URI for reconnect
+    if (!rt->original_uri) {
+        rt->original_uri = av_strdup(uri);
+        if (!rt->original_uri)
+            return AVERROR(ENOMEM);
+    }
+    
+    // Initialize reconnect variables
+    rt->reconnect_count = 0;
+    rt->reconnect_delay = 1000; // Start with 1 second
+    if (rt->reconnect_delay_max <= 0)
+        rt->reconnect_delay_max = 60000; // Default 60 seconds max
 
     av_url_split(proto, sizeof(proto), auth, sizeof(auth),
                  hostname, sizeof(hostname), &port,
@@ -3184,6 +3350,9 @@ static const AVOption rtmp_options[] = {
     {"listen",      "Listen for incoming rtmp connections", OFFSET(listen), AV_OPT_TYPE_INT, {.i64 = 0}, INT_MIN, INT_MAX, DEC, .unit = "rtmp_listen" },
     {"tcp_nodelay", "Use TCP_NODELAY to disable Nagle's algorithm", OFFSET(tcp_nodelay), AV_OPT_TYPE_INT, {.i64 = 0}, 0, 1, DEC|ENC},
     {"timeout", "Maximum timeout (in seconds) to wait for incoming connections. -1 is infinite. Implies -rtmp_listen 1",  OFFSET(listen_timeout), AV_OPT_TYPE_INT, {.i64 = -1}, INT_MIN, INT_MAX, DEC, .unit = "rtmp_listen" },
+    {"rtmp_reconnect", "Auto reconnect on connection failure", OFFSET(reconnect_enabled), AV_OPT_TYPE_BOOL, {.i64 = 0}, 0, 1, DEC},
+    {"rtmp_reconnect_streamed", "Auto reconnect on connection failure for streamed mode", OFFSET(reconnect_streamed), AV_OPT_TYPE_BOOL, {.i64 = 0}, 0, 1, DEC},
+    {"rtmp_reconnect_delay_max", "Maximum reconnect delay in milliseconds", OFFSET(reconnect_delay_max), AV_OPT_TYPE_INT, {.i64 = 60000}, 1000, 300000, DEC},
     { NULL },
 };
 
