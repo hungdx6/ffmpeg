@@ -35,7 +35,6 @@
 #include "libavutil/mem.h"
 #include "libavutil/opt.h"
 #include "libavutil/random_seed.h"
-#include "libavutil/time.h"
 #include "avformat.h"
 #include "internal.h"
 
@@ -135,11 +134,6 @@ typedef struct RTMPContext {
     char          auth_params[500];
     int           do_reconnect;
     int           auth_tried;
-    int           reconnect_enabled;     ///< enable auto reconnect on error
-    int           reconnect_timeout;     ///< timeout in seconds for reconnect attempts
-    int64_t       reconnect_start_time;  ///< timestamp when reconnect started
-    int           reconnect_attempts;    ///< number of reconnect attempts made
-    int           max_reconnect_attempts; ///< maximum reconnect attempts before giving up
 } RTMPContext;
 
 #define PLAYER_KEY_OPEN_PART_LEN 30   ///< length of partial key used for first client digest signing
@@ -168,7 +162,6 @@ static const uint8_t rtmp_server_key[] = {
 static int handle_chunk_size(URLContext *s, RTMPPacket *pkt);
 static int handle_window_ack_size(URLContext *s, RTMPPacket *pkt);
 static int handle_set_peer_bw(URLContext *s, RTMPPacket *pkt);
-static int rtmp_do_reconnect(URLContext *s);
 
 static int add_tracked_method(RTMPContext *rt, const char *name, int id)
 {
@@ -354,7 +347,6 @@ static int gen_connect(URLContext *s, RTMPContext *rt)
         if ((fourcc_str_len + 1) % 5 != 0) {
             av_log(s, AV_LOG_ERROR, "Malformed rtmp_enhanched_codecs, "
                    "should be of the form hvc1[,av01][,vp09][,...]\n");
-            ff_rtmp_packet_destroy(&pkt);
             return AVERROR(EINVAL);
         }
 
@@ -364,21 +356,13 @@ static int gen_connect(URLContext *s, RTMPContext *rt)
 
         while(fourcc_data - rt->enhanced_codecs < fourcc_str_len) {
             unsigned char fourcc[5];
-            if (!strncmp(fourcc_data, "ac-3", 4) ||
+            if (!strncmp(fourcc_data, "hvc1", 4) ||
                 !strncmp(fourcc_data, "av01", 4) ||
-                !strncmp(fourcc_data, "avc1", 4) ||
-                !strncmp(fourcc_data, "ec-3", 4) ||
-                !strncmp(fourcc_data, "fLaC", 4) ||
-                !strncmp(fourcc_data, "hvc1", 4) ||
-                !strncmp(fourcc_data, ".mp3", 4) ||
-                !strncmp(fourcc_data, "mp4a", 4) ||
-                !strncmp(fourcc_data, "Opus", 4) ||
                 !strncmp(fourcc_data, "vp09", 4)) {
                     av_strlcpy(fourcc, fourcc_data, sizeof(fourcc));
                     ff_amf_write_string(&p, fourcc);
             } else {
                     av_log(s, AV_LOG_ERROR, "Unsupported codec fourcc, %.*s\n", 4, fourcc_data);
-                    ff_rtmp_packet_destroy(&pkt);
                     return AVERROR_PATCHWELCOME;
             }
 
@@ -1263,10 +1247,7 @@ static int rtmp_handshake(URLContext *s, RTMPContext *rt)
     int i;
     int server_pos, client_pos;
     uint8_t digest[32], signature[32];
-    int ret;
-#if CONFIG_FFRTMPCRYPT_PROTOCOL
-    int type = 0;
-#endif
+    int ret, type = 0;
 
     av_log(s, AV_LOG_DEBUG, "Handshaking...\n");
 
@@ -1275,8 +1256,7 @@ static int rtmp_handshake(URLContext *s, RTMPContext *rt)
     for (i = 9; i <= RTMP_HANDSHAKE_PACKET_SIZE; i++)
         tosend[i] = av_lfg_get(&rnd) >> 24;
 
-#if CONFIG_FFRTMPCRYPT_PROTOCOL
-    if (rt->encrypted) {
+    if (CONFIG_FFRTMPCRYPT_PROTOCOL && rt->encrypted) {
         /* When the client wants to use RTMPE, we have to change the command
          * byte to 0x06 which means to use encrypted data and we have to set
          * the flash version to at least 9.0.115.0. */
@@ -1291,7 +1271,6 @@ static int rtmp_handshake(URLContext *s, RTMPContext *rt)
         if ((ret = ff_rtmpe_gen_pub_key(rt->stream, tosend + 1)) < 0)
             return ret;
     }
-#endif
 
     client_pos = rtmp_handshake_imprint_with_digest(tosend + 1, rt->encrypted);
     if (client_pos < 0)
@@ -1325,9 +1304,7 @@ static int rtmp_handshake(URLContext *s, RTMPContext *rt)
             return server_pos;
 
         if (!server_pos) {
-#if CONFIG_FFRTMPCRYPT_PROTOCOL
             type = 1;
-#endif
             server_pos = rtmp_validate_digest(serverdata + 1, 8);
             if (server_pos < 0)
                 return server_pos;
@@ -1357,8 +1334,7 @@ static int rtmp_handshake(URLContext *s, RTMPContext *rt)
         if (ret < 0)
             return ret;
 
-#if CONFIG_FFRTMPCRYPT_PROTOCOL
-        if (rt->encrypted) {
+        if (CONFIG_FFRTMPCRYPT_PROTOCOL && rt->encrypted) {
             /* Compute the shared secret key sent by the server and initialize
              * the RC4 encryption. */
             if ((ret = ff_rtmpe_compute_secret_key(rt->stream, serverdata + 1,
@@ -1368,7 +1344,6 @@ static int rtmp_handshake(URLContext *s, RTMPContext *rt)
             /* Encrypt the signature received by the server. */
             ff_rtmpe_encrypt_sig(rt->stream, signature, digest, serverdata[0]);
         }
-#endif
 
         if (memcmp(signature, clientdata + RTMP_HANDSHAKE_PACKET_SIZE - 32, 32)) {
             av_log(s, AV_LOG_ERROR, "Signature mismatch\n");
@@ -1389,30 +1364,25 @@ static int rtmp_handshake(URLContext *s, RTMPContext *rt)
         if (ret < 0)
             return ret;
 
-#if CONFIG_FFRTMPCRYPT_PROTOCOL
-        if (rt->encrypted) {
+        if (CONFIG_FFRTMPCRYPT_PROTOCOL && rt->encrypted) {
             /* Encrypt the signature to be send to the server. */
             ff_rtmpe_encrypt_sig(rt->stream, tosend +
                                  RTMP_HANDSHAKE_PACKET_SIZE - 32, digest,
                                  serverdata[0]);
         }
-#endif
 
         // write reply back to the server
         if ((ret = ffurl_write(rt->stream, tosend,
                                RTMP_HANDSHAKE_PACKET_SIZE)) < 0)
             return ret;
 
-#if CONFIG_FFRTMPCRYPT_PROTOCOL
-        if (rt->encrypted) {
+        if (CONFIG_FFRTMPCRYPT_PROTOCOL && rt->encrypted) {
             /* Set RC4 keys for encryption and update the keystreams. */
             if ((ret = ff_rtmpe_update_keystream(rt->stream)) < 0)
                 return ret;
         }
-#endif
     } else {
-#if CONFIG_FFRTMPCRYPT_PROTOCOL
-        if (rt->encrypted) {
+        if (CONFIG_FFRTMPCRYPT_PROTOCOL && rt->encrypted) {
             /* Compute the shared secret key sent by the server and initialize
              * the RC4 encryption. */
             if ((ret = ff_rtmpe_compute_secret_key(rt->stream, serverdata + 1,
@@ -1425,19 +1395,16 @@ static int rtmp_handshake(URLContext *s, RTMPContext *rt)
                                      serverdata[0]);
             }
         }
-#endif
 
         if ((ret = ffurl_write(rt->stream, serverdata + 1,
                                RTMP_HANDSHAKE_PACKET_SIZE)) < 0)
             return ret;
 
-#if CONFIG_FFRTMPCRYPT_PROTOCOL
-        if (rt->encrypted) {
+        if (CONFIG_FFRTMPCRYPT_PROTOCOL && rt->encrypted) {
             /* Set RC4 keys for encryption and update the keystreams. */
             if ((ret = ff_rtmpe_update_keystream(rt->stream)) < 0)
                 return ret;
         }
-#endif
     }
 
     return 0;
@@ -2030,7 +1997,7 @@ static int send_invoke_response(URLContext *s, RTMPPacket *pkt)
         pp = spkt.data;
         ff_amf_write_string(&pp, "onFCPublish");
     } else if (!strcmp(command, "publish")) {
-        char statusmsg[sizeof(filename) + 32];
+        char statusmsg[128];
         snprintf(statusmsg, sizeof(statusmsg), "%s is now published", filename);
         ret = write_begin(s);
         if (ret < 0)
@@ -2490,17 +2457,6 @@ static int get_packet(URLContext *s, int for_header)
             if (ret == 0) {
                 return AVERROR(EAGAIN);
             } else {
-                // Connection error - attempt reconnect if enabled
-                if (rt->reconnect_enabled && rt->is_input) {
-                    av_log(s, AV_LOG_WARNING, "RTMP connection lost, attempting reconnect...\n");
-                    ret = rtmp_do_reconnect(s);
-                    if (ret < 0) {
-                        av_log(s, AV_LOG_ERROR, "Failed to reconnect: %s\n", av_err2str(ret));
-                        return ret;
-                    }
-                    // Continue the loop to try reading again after reconnect
-                    continue;
-                }
                 return AVERROR(EIO);
             }
         }
@@ -2669,134 +2625,6 @@ static int inject_fake_duration_metadata(RTMPContext *rt)
  *             and 'playpath' is a file name (the rest of the path,
  *             may be prefixed with "mp4:")
  */
-
-static int rtmp_do_reconnect(URLContext *s)
-{
-    RTMPContext *rt = s->priv_data;
-    char proto[8], hostname[256], path[1024], auth[100], *fname;
-    char *old_app, *qmark, *n, fname_buffer[1024];
-    uint8_t buf[2048];
-    int port;
-    int ret;
-    int64_t current_time;
-
-    if (!rt->reconnect_enabled) {
-        av_log(s, AV_LOG_ERROR, "Reconnect is disabled\n");
-        return AVERROR(EIO);
-    }
-
-    current_time = av_gettime_relative() / 1000000; // Convert to seconds
-
-    // Start reconnect timer if this is the first attempt
-    if (rt->reconnect_attempts == 0) {
-        rt->reconnect_start_time = current_time;
-    }
-
-    // Check if reconnect timeout has been exceeded
-    if (current_time - rt->reconnect_start_time > rt->reconnect_timeout) {
-        av_log(s, AV_LOG_ERROR, "Reconnect timeout exceeded (%d seconds)\n", rt->reconnect_timeout);
-        return AVERROR(ETIMEDOUT);
-    }
-
-    // Check if max attempts reached
-    if (rt->reconnect_attempts >= rt->max_reconnect_attempts) {
-        av_log(s, AV_LOG_ERROR, "Maximum reconnect attempts reached (%d)\n", rt->max_reconnect_attempts);
-        return AVERROR(EIO);
-    }
-
-    rt->reconnect_attempts++;
-    av_log(s, AV_LOG_WARNING, "Attempting reconnect #%d/%d\n", 
-           rt->reconnect_attempts, rt->max_reconnect_attempts);
-
-    // Close existing connection
-    if (rt->stream) {
-        ffurl_closep(&rt->stream);
-    }
-
-    // Parse URL again for reconnection
-    av_url_split(proto, sizeof(proto), auth, sizeof(auth),
-                 hostname, sizeof(hostname), &port,
-                 path, sizeof(path), s->filename);
-
-    // Prepare connection string
-    if (!strcmp(proto, "rtmpt") || !strcmp(proto, "rtmpts")) {
-        ff_url_join(buf, sizeof(buf), "ffrtmphttp", NULL, hostname, port, NULL);
-    } else if (!strcmp(proto, "rtmps")) {
-        if (port < 0)
-            port = RTMPS_DEFAULT_PORT;
-        ff_url_join(buf, sizeof(buf), "tls", NULL, hostname, port, NULL);
-    } else if (!strcmp(proto, "rtmpe") || (!strcmp(proto, "rtmpte"))) {
-        ff_url_join(buf, sizeof(buf), "ffrtmpcrypt", NULL, hostname, port, NULL);
-        rt->encrypted = 1;
-    } else {
-        if (port < 0)
-            port = RTMP_DEFAULT_PORT;
-        ff_url_join(buf, sizeof(buf), "tcp", NULL, hostname, port, "?tcp_nodelay=%d", rt->tcp_nodelay);
-    }
-
-    // Attempt reconnection
-    if ((ret = ffurl_open_whitelist(&rt->stream, buf, AVIO_FLAG_READ_WRITE,
-                                    &s->interrupt_callback, NULL,
-                                    s->protocol_whitelist, s->protocol_blacklist, s)) < 0) {
-        av_log(s, AV_LOG_WARNING, "Reconnect attempt #%d failed: %s\n", 
-               rt->reconnect_attempts, av_err2str(ret));
-        
-        // Wait a bit before next attempt (exponential backoff)
-        int delay = FFMIN(rt->reconnect_attempts * 2, 10); // Max 10 seconds delay
-        av_usleep(delay * 1000000); // Convert to microseconds
-        
-        return ret;
-    }
-
-    // Reset connection state
-    rt->state = STATE_START;
-    rt->do_reconnect = 0;
-    rt->nb_invokes = 0;
-    
-    // Clear packet history
-    for (int i = 0; i < 2; i++) {
-        memset(rt->prev_pkt[i], 0, sizeof(**rt->prev_pkt) * rt->nb_prev_pkt[i]);
-    }
-    free_tracked_methods(rt);
-
-    // Perform handshake
-    if ((ret = rtmp_handshake(s, rt)) < 0) {
-        av_log(s, AV_LOG_WARNING, "Handshake failed during reconnect attempt #%d\n", rt->reconnect_attempts);
-        ffurl_closep(&rt->stream);
-        return ret;
-    }
-
-    rt->out_chunk_size = 128;
-    rt->in_chunk_size = 128;
-    rt->state = STATE_HANDSHAKED;
-
-    // Reconnect to the same app and playpath
-    if ((ret = gen_connect(s, rt)) < 0) {
-        av_log(s, AV_LOG_WARNING, "Connect failed during reconnect attempt #%d\n", rt->reconnect_attempts);
-        ffurl_closep(&rt->stream);
-        return ret;
-    }
-
-    // Wait for connection to be established
-    do {
-        ret = get_packet(s, 1);
-    } while (ret == AVERROR(EAGAIN));
-    
-    if (ret < 0) {
-        av_log(s, AV_LOG_WARNING, "Failed to establish connection during reconnect attempt #%d\n", rt->reconnect_attempts);
-        ffurl_closep(&rt->stream);
-        return ret;
-    }
-
-    av_log(s, AV_LOG_INFO, "Successfully reconnected on attempt #%d\n", rt->reconnect_attempts);
-    
-    // Reset reconnect state after successful reconnection
-    rt->reconnect_attempts = 0;
-    rt->reconnect_start_time = 0;
-    
-    return 0;
-}
-
 static int rtmp_open(URLContext *s, const char *uri, int flags, AVDictionary **opts)
 {
     RTMPContext *rt = s->priv_data;
@@ -3015,14 +2843,6 @@ reconnect:
     rt->max_sent_unacked = 2500000;
     rt->duration = 0;
 
-    // Initialize reconnect state
-    rt->reconnect_attempts = 0;
-    rt->reconnect_start_time = 0;
-    
-    // Initialize reconnect fields
-    rt->reconnect_attempts = 0;
-    rt->reconnect_start_time = 0;
-
     av_log(s, AV_LOG_DEBUG, "Proto = %s, path = %s, app = %s, fname = %s\n",
            proto, path, rt->app, rt->playpath);
     if (!rt->listen) {
@@ -3123,14 +2943,8 @@ static int rtmp_read(URLContext *s, uint8_t *buf, int size)
             rt->flv_off = rt->flv_size;
             return data_left;
         }
-        if ((ret = get_packet(s, 0)) < 0) {
-            // Check if this is a connection error and reconnect is enabled
-            if ((ret == AVERROR(EIO) || ret == AVERROR(EPIPE) || ret == AVERROR(ECONNRESET)) 
-                && rt->reconnect_enabled && rt->is_input) {
-                av_log(s, AV_LOG_WARNING, "Connection error in rtmp_read, reconnect will be handled in get_packet\n");
-            }
-            return ret;
-        }
+        if ((ret = get_packet(s, 0)) < 0)
+           return ret;
     }
     return orig_size;
 }
@@ -3228,12 +3042,7 @@ static int rtmp_write(URLContext *s, const uint8_t *buf, int size)
                                              pkttype, ts, pktsize)) < 0)
                 return ret;
 
-            // If rt->listen, then we're running as a a server and should
-            // use the ID that we've sent in Stream Begin and in the
-            // _result to createStream.
-            // Otherwise, we're running as a client and should use the ID
-            // that we've received in the createStream from the server.
-            rt->out_pkt.extra = (rt->listen) ? rt->nb_streamid : rt->stream_id;
+            rt->out_pkt.extra = rt->stream_id;
             rt->flv_data = rt->out_pkt.data;
         }
 
@@ -3344,9 +3153,6 @@ static const AVOption rtmp_options[] = {
     {"listen",      "Listen for incoming rtmp connections", OFFSET(listen), AV_OPT_TYPE_INT, {.i64 = 0}, INT_MIN, INT_MAX, DEC, .unit = "rtmp_listen" },
     {"tcp_nodelay", "Use TCP_NODELAY to disable Nagle's algorithm", OFFSET(tcp_nodelay), AV_OPT_TYPE_INT, {.i64 = 0}, 0, 1, DEC|ENC},
     {"timeout", "Maximum timeout (in seconds) to wait for incoming connections. -1 is infinite. Implies -rtmp_listen 1",  OFFSET(listen_timeout), AV_OPT_TYPE_INT, {.i64 = -1}, INT_MIN, INT_MAX, DEC, .unit = "rtmp_listen" },
-    {"rtmp_reconnect", "Enable automatic reconnection on connection failure", OFFSET(reconnect_enabled), AV_OPT_TYPE_INT, {.i64 = 0}, 0, 1, DEC},
-    {"rtmp_reconnect_timeout", "Maximum time in seconds to attempt reconnection (default: 60)", OFFSET(reconnect_timeout), AV_OPT_TYPE_INT, {.i64 = 60}, 1, 3600, DEC},
-    {"rtmp_max_reconnect_attempts", "Maximum number of reconnect attempts (default: 10)", OFFSET(max_reconnect_attempts), AV_OPT_TYPE_INT, {.i64 = 10}, 1, 100, DEC},
     { NULL },
 };
 
